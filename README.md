@@ -1,2 +1,2 @@
 # elf.js
-A simple parse for ELF files
+A simple parser for ELF files
