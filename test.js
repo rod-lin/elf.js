@@ -3,7 +3,8 @@
 var elf = require("./elf");
 var fs = require("fs");
 
-var buf = fs.readFileSync("test.elf", "ascii");
+var buf = fs.readFileSync("test.elf", "binary");
+
 buf = elf.fromString(buf);
 
 // console.log(buf);
@@ -27,6 +28,10 @@ buf = elf.fromString(buf);
 
 // console.log(ret);
 
-console.log(elf.parseELFHeader(buf));
+var parsed = elf.parseELF(buf);
 
+console.log(parsed);
+
+// console.log(parsed.sht.length);
+// console.log(elf.unpack("s@b", new Uint8Array([ 0x31, 0x31, 0x31, 0x31, 0x0, 0x1 ]).buffer));
 // console.log(elf.unpack("<l", new Uint8Array([ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x1f, 0x80 ]).buffer));

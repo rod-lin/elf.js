@@ -26,12 +26,12 @@
 
 	mod.toString = function (buf, i, len) {
 		i = i || 0;
-		len = len || buf.length; // !! if len == 0, len = buf.length
+		len = len === undefined ? buf.byteLength : len;
 
 		var j = i + len;
 		var arr = new Uint8Array(buf);
 
-		if (j > arr.length) throw "max length exceeded";
+		assert(j <= arr.length, "max length exceeded(max " + arr.length + ", " + j + " asked)");
 
 		var ret = "";
 
@@ -41,6 +41,17 @@
 
 		return ret;
 	};
+
+	function findZero(buf, ofs) {
+		var arr = new Uint8Array(buf);
+
+		for (var i = ofs; i < arr.length; i++) {
+			if (arr[i] === 0)
+				return i;
+		}
+
+		return -1;
+	}
 
 	// Rules(similar to the struct module in Python)
 	//     1. "x": padding byte, no value(null)
@@ -54,6 +65,7 @@
 	//     9. "f": float32
 	//    10. "d": double64
 	//    11. "s123": string of length 123. Can be other numbers. Doesn't read the ending '\0'.
+	//    12. "s@": string ending with '\0'
 	//     
 	// Endian:
 	//     ">" for big-endian
@@ -143,16 +155,24 @@
 
 				case "s":
 					for (var j = i + 1; j < rule.length && !isNaN(parseInt(rule[j])); j++);
-					var len = rule.substring(i + 1, j);
-					i = j - 1;
-					
-					if (!len.length) {
-						ret.push(String.fromCharCode(view.getUint8(ofs)));
-						ofs++;
-					} else {
-						len = parseInt(len);
 
-						if (isNaN(len)) throw "lenght not a number";
+					if (j == i + 1) { // no length followed
+						if (rule[j] == "@") { // "s@" a string ended with '\0'
+							j = findZero(buf, ofs);
+							
+							ret.push(mod.toString(buf, ofs, j - ofs));
+							ofs = j + 1; // add one for the remaining 1
+							i++;
+						} else {
+							ret.push(String.fromCharCode(view.getUint8(ofs)));
+							ofs++;
+						}
+					} else {
+						var len = rule.substring(i + 1, j);
+						i = j - 1;
+
+						len = parseInt(len);
+						assert(!isNaN(len), "lenght not a number");
 
 						ret.push(mod.toString(buf, ofs, len));
 						ofs += len;
@@ -202,13 +222,25 @@
 		"243": "RISC-V"
 	};
 
-	mod.assert = function (cond, err) {
+	function assert(cond, err) {
 		if (!cond) {
-			throw err;
+			throw new Error(err);
 		}
-	};
+	}
 
-	mod.parseELFHeader = function (buf) {
+	function match(obj, arr, keys) {
+		assert(keys.length == arr.length, "not the same length");
+
+		for (var i = 0; i < arr.length; i++) {
+			obj[keys[i]] = arr[i];
+		}
+
+		return obj;
+	}
+
+	mod.parseELFHeader = function (buf, ofs) {
+		ofs = ofs || 0;
+
 		var pre = mod.unpack(
 			"<s4"			// magic number(0x127 "ELF")
 			+ "B"			// class(1 for 32-bit or 2 for 64-bit)
@@ -216,11 +248,11 @@
 			+ "B"			// version 1(usually 1)
 			+ "B"			// system ABI
 			+ "II"			// 8-byte padding(the first byte could be API version)
-		, buf);
+		, buf, ofs);
 
-		mod.assert(pre[0] == "\x7FELF", "illegal magic number");
-		mod.assert(pre[1] == 1 || pre[1] == 2, "illegal class");
-		mod.assert(pre[2] == 1 || pre[2] == 2, "illegal endian");
+		assert(pre[0] == "\x7FELF", "illegal magic number");
+		assert(pre[1] == 1 || pre[1] == 2, "illegal class");
+		assert(pre[2] == 1 || pre[2] == 2, "illegal endian");
 
 		var bit = pre[1] == 1 ? 32 : 64;
 		var litend = pre[2] == 1 ? true : false;
@@ -243,7 +275,7 @@
 			+ "H"			// size of each entry in section header table
 			+ "H"			// number of entry in section header table
 			+ "H"			// index of section name of each section(??)
-		, buf, 16);
+		, buf, ofs + 16);
 
 		var ret = {
 			class: bit,
@@ -251,32 +283,113 @@
 			v1: pre[3],
 
 			abi: pre[4],
-			abi_name: table_abiname[pre[4]],
-
-			type: head[0],
-			
-			arch: head[1],
-			arch_name: table_archname[head[1]],
-
-			v2: head[2],
-
-			entry: head[3],
-			phofs: head[4],
-			shofs: head[5],
-
-			flags: head[6],
-			size: head[7],
-
-			phentsize: head[8],
-			phnum: head[9],
-
-			shentsize: head[10],
-			shnum: head[11],
-
-			shstrndx: head[12]
+			abi_name: table_abiname[pre[4]]
 		};
 
+		match(ret, head, [
+			"type", "arch", "v2", "entry",
+			"phofs", "shofs", "flags", "size",
+			"phentsize", "phnum", "shentsize",
+			"shnum", "shstrndx"
+		]);
+
+		ret.arch_name = table_archname[ret.arch];
+
 		return ret;
+	};
+
+	// program header table entry
+	mod.parsePHEntry = function (header, buf, ofs) {
+		ofs = ofs || 0;
+
+		var ent = mod.unpack(
+			(header.litend ? "<" : ">")
+			+ "I" // type
+			+ (header.class == 64 ? "ILLLLLL" : "IIIIIII") // rest
+		, buf, ofs);
+
+		var ret = {};
+
+		if (header.class == 64) {
+			match(ret, ent, [ "type", "flags", "offset", "vaddr", "paddr", "file_size", "mem_size", "align" ]);
+		} else {
+			match(ret, ent, [ "type", "offset", "vaddr", "paddr", "file_size", "mem_size", "flags", "align" ]);
+		}
+
+		return ret;
+	};
+
+	// section header table entry
+	mod.parseSHEntry = function (header, buf, ofs) {
+		ofs = ofs || 0;
+
+		var rule = (header.litend ? "<" : ">");
+
+		if (header.class == 64) {
+			rule += "IILLLLIILL";
+		} else {
+			rule += "IIIIIIIIII";
+		}
+
+		var ent = mod.unpack(rule, buf, ofs);
+
+		var ret = {};
+
+		match(ret, ent, [ "name", "type", "flags", "addr", "offset", "size", "link", "info", "addralign", "entsize" ]);
+
+		if (header.shstrofs)
+			ret.name = mod.lookupStrtab(buf, header.shstrofs, ret.name);
+
+		return ret;
+	};
+
+	mod.lookupStrtab = function (buf, ofs, index) {
+		return mod.unpack("s@", buf, ofs + index)[0];
+	};
+
+	mod.parseELF = function (buf, ofs) {
+		ofs = ofs || 0;
+
+		var header = mod.parseELFHeader(buf, ofs);
+
+		ofs = header.shofs + header.shstrndx * header.shentsize; // the file offset of the string table
+		var strtab = mod.parseSHEntry(header, buf, ofs);
+		header.shstrofs = strtab.offset;
+
+		// console.log(header.shentsize * header.shnum);
+		// console.log(mod.unpack("s@s@s@s@s@s@s@s@s@s@s@s@s@s@s@s@s@s@s@s@s@s@s@s@s@s@s@s@s@s@", buf, strtab.offset));
+
+		var pht = [];
+		ofs = header.phofs;
+
+		for (var i = 0; i < header.phnum; i++) {
+			pht.push(mod.parsePHEntry(header, buf, ofs));
+			ofs += header.phentsize;
+		}
+
+		var sht = [];
+		ofs = header.shofs;
+
+		// console.log(ofs + 10 * header.shentsize);
+		// console.log(mod.unpack("<B", buf, ofs + 10 * header.shentsize));
+
+		for (var i = 0; i < header.shnum; i++) {
+			// if (i == header.shstrndx) continue;
+
+			var ent = mod.parseSHEntry(header, buf, ofs);
+			ent.id = i;
+
+			sht.push(ent);
+			// console.log(sht[i].name);
+
+			ofs += header.shentsize;
+		}
+
+		return {
+			header: header,
+			pht: pht,
+			sht: sht
+		};
 	};
 
 }));
